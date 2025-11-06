@@ -2,134 +2,195 @@
 import torch
 import torchvision.transforms as transforms
 from torch.utils.data import Dataset, DataLoader
-import medmnist
 import numpy as np
 from PIL import Image
 import glob
 import os
+import pandas as pd
+import json
 
-from config import MODALITY_CONFIG, IMG_SIZE_2D, BATCH_SIZE, DATA_ROOT
-
-# --- MONAI Imports for 3D Data Loading ---
-from monai.data import Dataset as MonaiDataset, DataLoader as MonaiDataLoader
-from monai.transforms import (
-    Compose,
-    LoadImaged,
-    EnsureChannelFirstd,
-    Resized,
-    ScaleIntensityRanged,
-    ToTensord,
+from config import (
+    MODALITY_CONFIG, IMG_SIZE_2D, BATCH_SIZE, 
+    DATA_ROOT, CLASS_MAP_JSON
 )
 
-# --- 2D Dataset (Original) ---
-class Medmnist2DDataset(Dataset):
-    """Wrapper for medmnist, used to mock XRAY."""
-    def __init__(self, dataset_name, split, modality):
-        DataClass = getattr(medmnist, f"{dataset_name}MNIST")
-        
-        transform = transforms.Compose([
-            transforms.Resize((IMG_SIZE_2D, IMG_SIZE_2D)),
-            transforms.ToTensor(), 
-        ])
+# --- MONAI Imports ---
+from monai.data import Dataset as MonaiDataset, DataLoader as MonaiDataLoader
+from monai.transforms import (
+    Compose, LoadImaged, EnsureChannelFirstd, Resized,
+    ScaleIntensityRanged, RandAffined, ToTensord
+)
 
-        data_obj = DataClass(split=split, transform=transform, download=True)
+# --- Dynamic Class Map Builder ---
+def build_class_map():
+    """
+    Scans all 'labels.csv' files in the data directory to build a
+    dynamic, unified class map (e.g., {"Healthy": 0, "Glioma": 1, ...}).
+    Saves the map to 'class_map.json'.
+    """
+    print("Building class map...")
+    all_disease_names = set()
+
+    # Scan all 2D and 3D 'labels.csv' files
+    for modality in MODALITY_CONFIG.keys():
+        for split in ["train", "test"]:
+            labels_path = DATA_ROOT / modality / split / "labels.csv"
+            if not labels_path.exists():
+                print(f"Warning: Missing required file {labels_path}")
+                continue
+                
+            df = pd.read_csv(labels_path)
+            if "disease" not in df.columns:
+                raise ValueError(f"'disease' column not found in {labels_path}")
+                
+            all_disease_names.update(df["disease"].unique())
+
+    if not all_disease_names:
+        raise FileNotFoundError(f"No 'labels.csv' files found in {DATA_ROOT}. Cannot build class map.")
+
+    # Create the map and save it
+    sorted_names = sorted(list(all_disease_names))
+    class_map = {name: i for i, name in enumerate(sorted_names)}
+    
+    with open(CLASS_MAP_JSON, 'w') as f:
+        json.dump(class_map, f, indent=4)
         
-        self.data_list = [data_obj.imgs[i] for i in range(len(data_obj))]
-        self.labels = torch.from_numpy(data_obj.labels).float()
+    print(f"Class map built and saved to {CLASS_MAP_JSON}")
+    print(f"Classes found: {class_map}")
+    return class_map
+
+def load_class_map():
+    """Loads the pre-built class map. Fails if 'train.py' hasn't been run."""
+    if not CLASS_MAP_JSON.exists():
+        raise FileNotFoundError(f"{CLASS_MAP_JSON} not found. Please run train.py first to build the class map.")
+    with open(CLASS_MAP_JSON, 'r') as f:
+        class_map = json.load(f)
+    return class_map
+
+# --- 2D Dataset Classes (Now use the class_map) ---
+class Base2DDataset(Dataset):
+    """Base class for NIH ChestX-ray and Histopathology."""
+    def __init__(self, data_dir, transform, class_map, modality):
+        self.data_dir = data_dir
+        self.transform = transform
+        self.class_map = class_map
         self.modality = modality
 
+        labels_path = os.path.join(data_dir, "labels.csv")
+        if not os.path.exists(labels_path):
+            raise FileNotFoundError(f"Required {labels_path} not found.")
+            
+        self.label_df = pd.read_csv(labels_path)
+        
+        # Map file paths to their labels
+        self.image_paths = []
+        self.labels = []
+        
+        for _, row in self.label_df.iterrows():
+            img_path = os.path.join(data_dir, row["image_filename"])
+            if not os.path.exists(img_path):
+                print(f"Warning: Image {img_path} listed in CSV but not found on disk.")
+                continue
+            
+            self.image_paths.append(img_path)
+            self.labels.append(self.class_map[row["disease"]])
+
     def __len__(self):
-        return len(self.data_list)
+        return len(self.image_paths)
 
     def __getitem__(self, idx):
-        # Medmnist images are PIL, we apply transform
-        img = self.data_list[idx]
+        img_path = self.image_paths[idx]
+        image = Image.open(img_path).convert("RGB")
+        label = self.labels[idx]
+        
         if self.transform:
-            img = self.transform(img)
-        # Return image tensor, label, and modality type
-        return img, self.labels[idx], self.modality
+            image = self.transform(image)
+            
+        # Return image, numeric label, and modality name
+        return image, torch.tensor(label, dtype=torch.long), self.modality
 
-# --- 3D Dataset (Replaced Mock with Real NIfTI Loader) ---
-def get_3d_transforms(modality):
-    """Returns MONAI transform pipeline for 3D volumes."""
+def get_2d_transforms(is_train=True):
+    """Returns 2D transforms. Includes augmentation for training."""
+    transform_list = [
+        transforms.Resize((IMG_SIZE_2D, IMG_SIZE_2D)),
+    ]
+    
+    if is_train:
+        transform_list.extend([
+            transforms.RandomHorizontalFlip(),
+            transforms.RandomRotation(10),
+        ])
+        
+    transform_list.extend([
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+    ])
+    return transforms.Compose(transform_list)
+
+# --- 3D Dataset (NIfTI Loader for MRI) ---
+def get_mri_transforms(modality, is_train=True):
+    """Returns MONAI transform pipeline for 3D MRI."""
     cfg = MODALITY_CONFIG[modality]
     img_size_3d = cfg["size"]
-
-    # Define intensity scaling
-    # These values are typical for CT scans (soft tissue window)
-    # They would need to be changed for MRI
-    intensity_min = -1024.0
-    intensity_max = 3072.0
     
-    return Compose(
-        [
-            # Load NIfTI file, "image" key points to the filepath
-            LoadImaged(keys=["image"]), 
-            # Ensure shape is (C, D, H, W)
-            EnsureChannelFirstd(keys=["image"]),
-            # Resize to model's expected input size
-            Resized(keys=["image"], spatial_size=img_size_3d),
-            # Normalize pixel intensities
-            ScaleIntensityRanged(
+    transform_list = [
+        LoadImaged(keys=["image"]), 
+        EnsureChannelFirstd(keys=["image"]),
+        Resized(keys=["image"], spatial_size=img_size_3d),
+        ScaleIntensityRanged(
+            keys=["image"], a_min=0.0, a_max=2000.0, 
+            b_min=0.0, b_max=1.0, clip=True
+        ),
+    ]
+    
+    if is_train:
+        # Add 3D augmentation
+        transform_list.append(
+            RandAffined(
                 keys=["image"],
-                a_min=intensity_min,
-                a_max=intensity_max,
-                b_min=0.0,
-                b_max=1.0,
-                clip=True,
-            ),
-            # Convert to Tensor
-            ToTensord(keys=["image", "label"]),
-        ]
-    )
+                prob=0.5,
+                rotate_range=(0, 0, np.pi / 15),
+                scale_range=(0.1, 0.1, 0.1)
+            )
+        )
+        
+    transform_list.append(ToTensord(keys=["image", "label"]))
+    return Compose(transform_list)
 
-def get_dataloader(dataset_name, modality, split="test", batch_size=BATCH_SIZE, shuffle=False):
-    if modality == "XRAY":
-        dataset = Medmnist2DDataset(dataset_name, split, modality)
-        return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle)
+# --- Main Loader Function ---
+def get_dataloader(modality, class_map, split="train", batch_size=BATCH_SIZE, shuffle=True):
     
-    elif modality in ["CT", "MRI"]:
-        # --- Real NIfTI Data Loading ---
-        # We assume data is in: data/raw/<modality>/<split>/
-        data_dir = DATA_ROOT / modality / split
-        
-        # NOTE: Create dummy NIfTI files if they don't exist for demo
-        _create_dummy_nifti_files(data_dir, 5)
-
-        # Scan for NIfTI files
-        image_files = sorted(glob.glob(os.path.join(data_dir, "*.nii.gz")))
-        
-        # Create dummy labels (replace with real labels)
-        labels = [np.random.randint(0, 2) for _ in image_files]
-        
-        # Create a list of dictionaries for MONAI
-        data_dicts = [
-            {"image": img_path, "label": label}
-            for img_path, label in zip(image_files, labels)
-        ]
+    data_dir = DATA_ROOT / modality / split
+    is_train = (split == "train")
+    
+    if modality in ["XRAY", "HISTOPATHOLOGY"]:
+        transforms_2d = get_2d_transforms(is_train=is_train)
+        dataset = Base2DDataset(data_dir, transform=transforms_2d, class_map=class_map, modality=modality)
+        return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=NUM_WORKERS)
+    
+    elif modality == "MRI":
+        labels_path = data_dir / "labels.csv"
+        if not labels_path.exists():
+            raise FileNotFoundError(f"Required {labels_path} not found.")
+            
+        label_df = pd.read_csv(labels_path)
+        data_dicts = []
+        for _, row in label_df.iterrows():
+            img_path = str(data_dir / row["image_filename"]) # NIfTI file (e.g., .nii.gz)
+            if not os.path.exists(img_path):
+                print(f"Warning: Image {img_path} listed in CSV but not found.")
+                continue
+            data_dicts.append({
+                "image": img_path,
+                "label": class_map[row["disease"]]
+            })
 
         if not data_dicts:
-            print(f"Warning: No NIfTI files found in {data_dir}. Demo will fail for {modality}.")
+            print(f"Warning: No valid NIfTI files found for {modality} in {data_dir}.")
 
-        transforms_3d = get_3d_transforms(modality)
+        transforms_3d = get_mri_transforms(modality, is_train=is_train)
         dataset = MonaiDataset(data=data_dicts, transform=transforms_3d)
-        
-        # Use MONAI's DataLoader
-        return MonaiDataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=0)
+        return MonaiDataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=NUM_WORKERS)
     
     else:
         raise ValueError(f"Modality {modality} not supported.")
-
-def _create_dummy_nifti_files(data_dir, num_files=5):
-    """Helper to create placeholder NIfTI files for the demo."""
-    import nibabel as nib
-    os.makedirs(data_dir, exist_ok=True)
-    
-    for i in range(num_files):
-        filepath = os.path.join(data_dir, f"dummy_scan_{i}.nii.gz")
-        if not os.path.exists(filepath):
-            print(f"Creating dummy NIfTI file: {filepath}")
-            # Create a 1x1x1 dummy volume
-            dummy_data = np.zeros((1, 1, 1), dtype=np.int16)
-            img = nib.Nifti1Image(dummy_data, affine=np.eye(4))
-            nib.save(img, filepath)
