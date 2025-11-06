@@ -23,7 +23,7 @@ from monai.transforms import (
 
 # --- 2D Dataset (Original) ---
 class Medmnist2DDataset(Dataset):
-    """Wrapper for medmnist, used to mock XRAY/ULTRASOUND."""
+    """Wrapper for medmnist, used to mock XRAY."""
     def __init__(self, dataset_name, split, modality):
         DataClass = getattr(medmnist, f"{dataset_name}MNIST")
         
@@ -84,7 +84,7 @@ def get_3d_transforms(modality):
     )
 
 def get_dataloader(dataset_name, modality, split="test", batch_size=BATCH_SIZE, shuffle=False):
-    if modality in ["XRAY", "ULTRASOUND"]:
+    if modality == "XRAY":
         dataset = Medmnist2DDataset(dataset_name, split, modality)
         return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle)
     
