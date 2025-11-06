@@ -12,7 +12,8 @@ Implements:
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import ConcatDataset, DataLoader, Subset
+# FIXED: Added 'Dataset' to the import line
+from torch.utils.data import Dataset, ConcatDataset, DataLoader, Subset 
 import numpy as np
 import time
 import os
