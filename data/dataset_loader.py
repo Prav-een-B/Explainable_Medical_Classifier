@@ -136,6 +136,7 @@ def get_mri_transforms(modality, is_train=True):
     ]
     
     if is_train:
+        # Add 3D augmentation
         transform_list.append(
             RandAffined(
                 keys=["image"],
@@ -187,68 +188,67 @@ def get_dataloader(modality, class_map, split="test", batch_size=BATCH_SIZE, shu
     else:
         raise ValueError(f"Modality {modality} not supported.")
 
-# --- ADDED: New Function for K-Fold Cross-Validation ---
+# --- K-Fold Cross-Validation Function ---
 def get_full_dataset(modality, class_map):
     """
     Loads and combines ALL data (train and test) for a single modality
-    into one single Dataset object, which is required for K-Fold CV.
+    into one single Dataset object (for 2D) or list of dicts (for 3D).
     """
     print(f"Loading full dataset for {modality}...")
-    datasets = []
     
     if modality in ["XRAY", "HISTOPATHOLOGY"]:
-        # Load train and test splits
-        try:
-            train_dir = DATA_ROOT / modality / "train"
-            train_transforms = get_2d_transforms(is_train=True)
-            train_dataset = Base2DDataset(train_dir, train_transforms, class_map, modality)
-            datasets.append(train_dataset)
-        except Exception as e:
-            print(f"Could not load train data for {modality}: {e}")
-            
-        try:
-            test_dir = DATA_ROOT / modality / "test"
-            test_transforms = get_2d_transforms(is_train=False) # No augmentation
-            test_dataset = Base2DDataset(test_dir, test_transforms, class_map, modality)
-            datasets.append(test_dataset)
-        except Exception as e:
-            print(f"Could not load test data for {modality}: {e}")
+        # 2D data: We must apply transforms *later*
+        # We create a custom dataset that holds PIL images
+        class CustomPILDataset(Dataset):
+            def __init__(self, data_list):
+                self.data_list = data_list # List of (PIL Image, label, modality)
+            def __len__(self):
+                return len(self.data_list)
+            def __getitem__(self, idx):
+                return self.data_list[idx]
+
+        data_list = []
+        for split in ["train", "test"]:
+            try:
+                data_dir = DATA_ROOT / modality / split
+                labels_path = os.path.join(data_dir, "labels.csv")
+                if not os.path.exists(labels_path):
+                    continue
+                label_df = pd.read_csv(labels_path)
+                
+                for _, row in label_df.iterrows():
+                    img_path = os.path.join(data_dir, row["image_filename"])
+                    if not os.path.exists(img_path):
+                        continue
+                    # Load PIL image, but don't transform yet
+                    image = Image.open(img_path).convert("RGB")
+                    label = class_map[row["disease"]]
+                    data_list.append((image, torch.tensor(label, dtype=torch.long), modality))
+            except Exception as e:
+                print(f"Could not load {split} data for {modality}: {e}")
+                
+        return CustomPILDataset(data_list)
 
     elif modality == "MRI":
-        # Load train and test splits
+        # 3D data: We return a list of dicts, transforms will be applied in train.py
         data_dicts = []
-        try:
-            train_dir = DATA_ROOT / modality / "train"
-            train_labels = pd.read_csv(train_dir / "labels.csv")
-            for _, row in train_labels.iterrows():
-                data_dicts.append({
-                    "image": str(train_dir / row["image_filename"]),
-                    "label": class_map[row["disease"]],
-                    "is_train": True
-                })
-        except Exception as e:
-            print(f"Could not load train data for {modality}: {e}")
-            
-        try:
-            test_dir = DATA_ROOT / modality / "test"
-            test_labels = pd.read_csv(test_dir / "labels.csv")
-            for _, row in test_labels.iterrows():
-                data_dicts.append({
-                    "image": str(test_dir / row["image_filename"]),
-                    "label": class_map[row["disease"]],
-                    "is_train": False
-                })
-        except Exception as e:
-            print(f"Could not load test data for {modality}: {e}")
-
-        # Need separate transforms for train/val splits in K-Fold
-        # This is complex. For simplicity, we'll use train transforms for all
-        # and rely on KFold to separate.
-        # A more advanced setup would use MONAI's Dataset a different way.
-        if not data_dicts:
-             return ConcatDataset([]) # Return empty
-        
-        transforms_3d = get_mri_transforms(modality, is_train=True)
-        return MonaiDataset(data=data_dicts, transform=transforms_3d)
-
-    return ConcatDataset(datasets)
+        for split in ["train", "test"]:
+            try:
+                data_dir = DATA_ROOT / modality / split
+                labels_path = data_dir / "labels.csv"
+                if not labels_path.exists():
+                    continue
+                label_df = pd.read_csv(labels_path)
+                
+                for _, row in label_df.iterrows():
+                    img_path = str(data_dir / row["image_filename"])
+                    if not os.path.exists(img_path):
+                        continue
+                    data_dicts.append({
+                        "image": img_path,
+                        "label": class_map[row["disease"]]
+                    })
+            except Exception as e:
+                print(f"Could not load {split} data for {modality}: {e}")
+                
+        return data_dicts # Return list of dicts
