@@ -5,17 +5,42 @@
 import torch
 from monai.visualize import GradCAM
 
+# FIXED (Fix 5): Helper function to resolve string path to a module
+def resolve_module(root, path):
+    """
+    Resolves a string path (e.g., 'transformer.blocks[-1].norm1') 
+    to an actual module object within the root model.
+    """
+    if path.startswith("model."):
+        path = path[len("model."):]
+    obj = root
+    for part in path.split('.'):
+        if '[' in part and ']' in part:
+            name, idxpart = part.split('[')
+            idx = int(idxpart.strip(']'))
+            obj = getattr(obj, name)[idx]
+        else:
+            obj = getattr(obj, part)
+    return obj
+
 class GradCAM3DExplainer:
     def __init__(self, model, target_layer):
         """
         model: The MONAI 3D model (e.g., ViT)
-        target_layer: The layer name to hook into. 
-                      For MONAI ViT, 'model.transformer.blocks[-1].norm1' is a good choice.
+        target_layer: The layer name string to hook into. 
+                      (e.g., 'transformer.blocks[-1].norm1')
         """
         self.model = model
+        
+        # FIXED (Fix 5): Resolve the string path to the actual module
+        if isinstance(target_layer, str):
+            target_mod = resolve_module(self.model, target_layer)
+        else:
+            target_mod = target_layer
+            
         self.gradcam = GradCAM(
             nn_module=self.model,
-            target_layers=target_layer
+            target_layers=[target_mod] # MONAI expects a list of modules
         )
 
     def explain(self, volume_tensor_batch, label=None):
@@ -26,15 +51,12 @@ class GradCAM3DExplainer:
         
         Returns: A 3D heatmap (B, 1, D, H, W)
         """
-        # GradCAM requires the model to be in training mode to hook properly
-        self.model.train() 
-        
-        # FIXED: Ensure tensor is on the same device as the model
-        volume_tensor_batch = volume_tensor_batch.to(next(self.model.parameters()).device)
-        
-        # MONAI's GradCAM computes the map
-        # We get one map per item in the batch
-        heatmap = self.gradcam(x=volume_tensor_batch, class_idx=label)
-        
-        self.model.eval() # Set model back to eval mode
+        # FIXED (Fix 6): Use model.eval() with gradients enabled
+        self.model.eval()
+        with torch.enable_grad():
+            # (Fix 4, Potential Issue): Ensure tensor is on the same device as the model
+            volume_tensor_batch = volume_tensor_batch.to(next(self.model.parameters()).device)
+            
+            heatmap = self.gradcam(x=volume_tensor_batch, class_idx=label)
+            
         return heatmap
