@@ -1,38 +1,47 @@
 # explainability/shap_explainer.py
 """
-SHAP explainer module.
-We provide a wrapper using KernelExplainer for black-box models (works but can be slow).
-For neural nets with gradients available, one could use GradientExplainer or DeepExplainer.
+SHAP explainer module for 2D and 3D data.
 """
 
 import shap
 import numpy as np
 from config import SHAP_BACKGROUND_SAMPLES
-from utils.visualization import show_image_with_mask
 
-class SHAPExplainer:
+# --- 2D SHAP Explainer (X-ray, Ultrasound) ---
+class SHAP2DExplainer:
     def __init__(self, predict_fn, background_data):
-        """
-        predict_fn: function mapping list/np.array of images -> probabilities (N x C)
-        background_data: small set of images to use as background (np array)
-        """
         self.predict_fn = predict_fn
         self.background = background_data
-        # KernelExplainer expects a function that accepts 2D arrays; we'll wrap images to flat vectors inside the function.
         self.explainer = shap.KernelExplainer(self._wrapped_predict, self.background.reshape(len(self.background), -1))
 
     def _wrapped_predict(self, flat_images):
-        """
-        Accepts flat images with shape (N, D) and returns predictions
-        """
         imgs = flat_images.reshape((-1, ) + self.background.shape[1:])  # (N, H, W, C)
         return self.predict_fn(imgs)
 
     def explain(self, images_to_explain, nsamples=100):
-        """
-        images_to_explain: np array shape (N,H,W,C)
-        returns shap_values (list or array)
-        """
         flat = images_to_explain.reshape(len(images_to_explain), -1)
+        shap_values = self.explainer.shap_values(flat, nsamples=nsamples)
+        return shap_values
+
+# --- 3D SHAP Explainer (CT, MRI) ---
+class SHAP3DExplainer:
+    def __init__(self, predict_fn, background_data):
+        self.predict_fn = predict_fn
+        self.background = background_data
+        
+        # Flatten the 3D data for the explainer (D*H*W features)
+        flat_background = self.background.reshape(len(self.background), -1)
+        # Note: 3D SHAP is extremely slow/computationally expensive in practice
+        self.explainer = shap.KernelExplainer(self._wrapped_predict, flat_background)
+
+    def _wrapped_predict(self, flat_volumes):
+        """Accepts flat volumes and returns predictions."""
+        imgs_shape = self.background.shape[1:] 
+        # Reshape flat vectors back to 3D volumes (D, H, W)
+        volumes = flat_volumes.reshape((-1, ) + imgs_shape)
+        return self.predict_fn(volumes)
+
+    def explain(self, volumes_to_explain, nsamples=100):
+        flat = volumes_to_explain.reshape(len(volumes_to_explain), -1)
         shap_values = self.explainer.shap_values(flat, nsamples=nsamples)
         return shap_values
