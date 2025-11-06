@@ -12,8 +12,7 @@ Implements:
 import torch
 import torch.nn as nn
 import torch.optim as optim
-# FIXED: Added 'Dataset' to the import line
-from torch.utils.data import Dataset, ConcatDataset, DataLoader, Subset 
+from torch.utils.data import Dataset, ConcatDataset, DataLoader, Subset
 import numpy as np
 import time
 import os
@@ -34,6 +33,15 @@ from monai.data import Dataset as MonaiDataset, DataLoader as MonaiDataLoader
 
 # Ensure results directory exists
 os.makedirs(RESULTS_DIR, exist_ok=True)
+
+# FIXED (Fix 3): Helper function for robust logit extraction
+def extract_logits(outputs):
+    """Extracts logits from various model output types."""
+    if hasattr(outputs, "logits"):
+        return outputs.logits
+    if isinstance(outputs, (tuple, list)):
+        return outputs[0]
+    return outputs
 
 class TransformSubset(Dataset):
     """
@@ -73,10 +81,9 @@ def train_model_fold(model, dataloader_train, dataloader_val, criterion, optimiz
 
             optimizer.zero_grad()
             
-            if "ViT" in model.__class__.__name__: # MONAI ViT
-                logits, _ = model(inputs)
-            else: # HuggingFace ViT
-                logits = model(inputs).logits
+            # FIXED (Fix 3): Use robust logit extraction
+            outputs = model(inputs)
+            logits = extract_logits(outputs)
             
             loss = criterion(logits, labels.squeeze(-1).long())
             loss.backward()
@@ -98,10 +105,9 @@ def train_model_fold(model, dataloader_train, dataloader_val, criterion, optimiz
                 else:
                     inputs, labels = batch[0].to(DEVICE), batch[1].to(DEVICE)
 
-                if "ViT" in model.__class__.__name__:
-                    logits, _ = model(inputs)
-                else:
-                    logits = model(inputs).logits
+                # FIXED (Fix 3): Use robust logit extraction
+                outputs = model(inputs)
+                logits = extract_logits(outputs)
 
                 loss = criterion(logits, labels.squeeze(-1).long())
                 val_loss += loss.item() * inputs.size(0)
@@ -139,10 +145,9 @@ def train_final_model(model, dataloader_train, criterion, optimizer, num_epochs)
 
             optimizer.zero_grad()
             
-            if "ViT" in model.__class__.__name__: # MONAI ViT
-                logits, _ = model(inputs)
-            else: # HuggingFace ViT
-                logits = model(inputs).logits
+            # FIXED (Fix 3): Use robust logit extraction
+            outputs = model(inputs)
+            logits = extract_logits(outputs)
             
             loss = criterion(logits, labels.squeeze(-1).long())
             loss.backward()
@@ -156,6 +161,7 @@ def train_final_model(model, dataloader_train, criterion, optimizer, num_epochs)
 
 
 def main():
+    # ... (rest of main function is correct) ...
     # --- 1. Build Class Map ---
     try:
         class_map = build_class_map()
