@@ -176,7 +176,9 @@ def main_demo():
         return
         
     num_labels = len(class_map)
-    class_names_list = {v: k for k, v in class_map.items()}
+    # FIXED: Create a sorted list of class names from the map
+    # This ensures class_names_list[0] == "DiseaseA", class_names_list[1] == "DiseaseB", etc.
+    class_names_list = sorted(class_map.keys(), key=lambda k: class_map[k])
 
     # 2. Initialize Wrapper in INFERENCE mode
     try:
