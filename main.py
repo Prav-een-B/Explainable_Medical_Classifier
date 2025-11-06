@@ -41,7 +41,7 @@ def demo_modality(modality_type, dataset_name, multimodal_model, sample_count=4)
     batch = next(iter(dl))
 
     # 2. Prepare Inputs based on modality
-    if modality_type in ["XRAY", "ULTRASOUND"]:
+    if modality_type == "XRAY":
         input_tensors, labels = batch[0], batch[1]
         pil_imgs = preprocess_2d_for_pil(input_tensors)
         model_input = pil_imgs
@@ -67,7 +67,7 @@ def demo_modality(modality_type, dataset_name, multimodal_model, sample_count=4)
     # 4. Explainability (Routing)
     print(f"\n--- Explanation for first sample (pred: {preds[0]}) ---")
 
-    if modality_type in ["XRAY", "ULTRASOUND"]:
+    if modality_type == "XRAY":
         # 2D Explainer (LIME)
         def predict_wrapper_2d(images_np):
             pil_list = [Image.fromarray(x.astype('uint8')) for x in images_np]
