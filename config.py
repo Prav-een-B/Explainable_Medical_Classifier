@@ -35,8 +35,10 @@ K_FOLDS = 5
 # --- Paths ---
 SAVE_PATH = ROOT / "models" / "weights"
 RESULTS_DIR = ROOT / "results" 
-MODEL_2D_CHECKPOINT = SAVE_PATH / "best_model_2d.pth"
-MODEL_3D_CHECKPOINT = SAVE_PATH / "best_model_3d.pth"
+
+# FIXED (Fix 1): Changed to a directory path for save_pretrained
+MODEL_2D_CHECKPOINT = SAVE_PATH / "vit2d_checkpoint"   
+MODEL_3D_CHECKPOINT = SAVE_PATH / "best_model_3d.pth"  
 
 # Model
 VIT_2D_PRETRAINED = "google/vit-base-patch16-224-in21k"
@@ -44,7 +46,7 @@ VIT_3D_PRETRAINED = "monai/vitautoenc" # Not used, we train from scratch
 
 # Explainability
 LIME_SAMPLES = 1000
-SHAP_NSAMPLES = 100 # ADDED: Samples for SHAP (low for speed)
+SHAP_NSAMPLES = 100 
 
 # Device
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
