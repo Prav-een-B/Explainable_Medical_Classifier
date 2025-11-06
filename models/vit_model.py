@@ -47,6 +47,7 @@ class ViT2DWrapper:
             self.feature_extractor = AutoFeatureExtractor.from_pretrained(MODEL_2D_CHECKPOINT)
             self.model = ViTForImageClassification.from_pretrained(MODEL_2D_CHECKPOINT)
             
+        # FIXED (Fix 2): Ensure model is moved to device in both cases
         self.model.to(DEVICE)
         self.num_labels = num_labels
 
