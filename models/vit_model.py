@@ -8,7 +8,7 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 from config import (
-    VIT_2D_PRETRAINED, NUM_LABELS, DEVICE, 
+    VIT_2D_PRETRAINED, DEVICE, 
     MODALITY_CONFIG, IMG_SIZE_3D,
     MODEL_2D_CHECKPOINT, MODEL_3D_CHECKPOINT
 )
@@ -17,6 +17,15 @@ import os
 
 from monai.networks.nets import ViT
 from monai.utils import ensure_tuple
+
+# FIXED (Fix 3): Helper function for robust logit extraction
+def extract_logits(outputs):
+    """Extracts logits from various model output types."""
+    if hasattr(outputs, "logits"):
+        return outputs.logits
+    if isinstance(outputs, (tuple, list)):
+        return outputs[0]
+    return outputs
 
 # --- 2D Model Wrapper (HuggingFace) ---
 class ViT2DWrapper:
@@ -31,10 +40,10 @@ class ViT2DWrapper:
             )
         else:
             # Initialize for inference (load fine-tuned model)
+            # FIXED (Fix 1): This now correctly points to a directory
             if not MODEL_2D_CHECKPOINT.exists():
                 raise FileNotFoundError(f"Trained model not found at {MODEL_2D_CHECKPOINT}. Please run train.py first.")
             print(f"Loading trained 2D model from {MODEL_2D_CHECKPOINT}...")
-            # We must load the feature extractor from the same path
             self.feature_extractor = AutoFeatureExtractor.from_pretrained(MODEL_2D_CHECKPOINT)
             self.model = ViTForImageClassification.from_pretrained(MODEL_2D_CHECKPOINT)
             
@@ -53,12 +62,16 @@ class ViT2DWrapper:
             return np.array([]).reshape(0, self.num_labels)
         pixel_values = self.preprocess(pil_images)
         outputs = self.model(pixel_values)
-        logits = outputs.logits
+        
+        # FIXED (Fix 3): Use robust logit extraction
+        logits = extract_logits(outputs) 
+        
         probs = F.softmax(logits, dim=-1).cpu().numpy()
         return probs
     
     def save_checkpoint(self, path):
         """Saves the fine-tuned model and feature extractor."""
+        # FIXED (Fix 1): This now correctly saves to a directory
         print(f"Saving 2D model checkpoint to {path}")
         os.makedirs(path, exist_ok=True)
         self.model.save_pretrained(path)
@@ -87,18 +100,38 @@ class ViT3DWrapper:
             
         self.num_labels = num_labels
 
+    # FIXED (Fix 4): Handle both tensor and list inputs
     def preprocess(self, volume_tensors):
-        volume_batch = torch.stack(volume_tensors).to(DEVICE)
-        return volume_batch # Shape (B, C, D, H, W)
+        """
+        Accepts a list of 3D torch tensors (C, D, H, W) OR
+        a single batch tensor (B, C, D, H, W).
+        """
+        if isinstance(volume_tensors, torch.Tensor):
+            return volume_tensors.to(DEVICE)
+        else:
+            volume_batch = torch.stack(list(volume_tensors)).to(DEVICE)
+            return volume_batch # Shape (B, C, D, H, W)
 
     @torch.no_grad()
     def predict(self, volume_tensors):
+        """Returns softmax probabilities for given list of 3D volume tensors."""
         self.model.eval()
-        if not volume_tensors:
+        
+        # FIXED (Fix 4): Robust empty check
+        if volume_tensors is None:
             return np.array([]).reshape(0, self.num_labels)
+        if isinstance(volume_tensors, torch.Tensor) and volume_tensors.numel() == 0:
+            return np.array([]).reshape(0, self.num_labels)
+        if isinstance(volume_tensors, (list, tuple)) and not volume_tensors: # Check for empty list/tuple
+             return np.array([]).reshape(0, self.num_labels)
         
         volume_batch = self.preprocess(volume_tensors)
-        logits, _ = self.model(volume_batch)
+        
+        outputs = self.model(volume_batch)
+        
+        # FIXED (Fix 3): Use robust logit extraction
+        logits = extract_logits(outputs)
+        
         probs = F.softmax(logits, dim=-1).cpu().numpy()
         return probs
 
