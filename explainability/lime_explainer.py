@@ -9,6 +9,7 @@ from config import LIME_SAMPLES
 
 # --- 2D LIME Explainer (X-ray, Ultrasound) ---
 class LIME2DExplainer:
+    # FIXED: Use LIME_SAMPLES as the default for n_samples
     def __init__(self, predict_fn, top_labels=2, n_samples=LIME_SAMPLES):
         self.predict_fn = predict_fn
         self.explainer = lime_image.LimeImageExplainer()
