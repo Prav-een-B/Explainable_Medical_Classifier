@@ -167,7 +167,7 @@ def get_dataloader(modality, batch_size=BATCH_SIZE, shuffle=True, num_workers=NU
     elif m == "SKIN":
         ds = SkinDataset(KAGGLE_PATHS["SKIN"])
     elif m == "MRI":
-        ds = MRISliceDataset(KAGGLE_PATHS["MRI"])
+        ds = MRIDataset(KAGGLE_PATHS["MRI"])
     else:
         raise ValueError("Unknown modality")
     return DataLoader(ds, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers, pin_memory=True)
