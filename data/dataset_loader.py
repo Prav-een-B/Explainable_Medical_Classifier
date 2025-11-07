@@ -1,47 +1,39 @@
-# ============================================================
-# dataset_loader.py — unified loader for XRay, Skin, and MRI
-# ============================================================
-
+# data/dataset_loader.py
 from pathlib import Path
-import torch
-from torch.utils.data import Dataset, DataLoader
 import pandas as pd
 from PIL import Image
+import torch
+from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
+from config import KAGGLE_PATHS, IMG_SIZE_2D, BATCH_SIZE, NUM_WORKERS
 
-# --- Config ---
-IMG_SIZE = 224
-
-KAGGLE_PATHS = {
-    "XRAY": Path("/kaggle/input/data"),
-    "SKIN": Path("/kaggle/input/skin-cancer-mnist-ham10000"),
-    "MRI":  Path("/kaggle/input/brain-mri-images-for-brain-tumor-detection")
-}
-
-# --- Transforms ---
-DEFAULT_TRANSFORM = transforms.Compose([
-    transforms.Resize((IMG_SIZE, IMG_SIZE)),
+# Single transform used for all 2D tasks
+TRANSFORM = transforms.Compose([
+    transforms.Resize((IMG_SIZE_2D, IMG_SIZE_2D)),
     transforms.ToTensor(),
     transforms.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225])
 ])
 
-# ============================================================
-# NIH Chest X-ray Dataset
-# ============================================================
 class NIHChestXrayDataset(Dataset):
-    def __init__(self, csv_path, img_root, transform=None):
+    def __init__(self, csv_path, root_dir, transform=None, skip_missing=True):
         self.df = pd.read_csv(csv_path)
-        self.img_dir = Path(img_root)
-        self.transform = transform or DEFAULT_TRANSFORM
+        self.root = Path(root_dir)
+        self.transform = transform or TRANSFORM
+        self.skip_missing = skip_missing
+
+        # build a filename -> path map from nested images_* directories
         self.image_map = {}
-        for sub in sorted(self.img_dir.glob("images_*")):
-            nested = sub / "images"
-            if nested.exists():
-                for f in nested.glob("*.png"):
+        for p in sorted(self.root.glob("images_*")):
+            imgdir = p / "images"
+            if imgdir.exists():
+                for f in imgdir.glob("*"):
                     self.image_map[f.name] = f
-        labels = self.df["Finding Labels"].str.split("|").explode().unique()
-        self.classes = sorted([l for l in labels if l != "No Finding"])
-        self.class_to_idx = {c: i for i, c in enumerate(self.classes)}
+
+        # class list (exclude 'No Finding' from class list or keep depending on use)
+        all_labels = self.df["Finding Labels"].str.split("|").explode().unique()
+        classes = [c for c in sorted(all_labels) if str(c) and c != "No Finding"]
+        self.classes = classes
+        self.class_to_idx = {c:i for i,c in enumerate(self.classes)}
 
     def __len__(self):
         return len(self.df)
@@ -49,31 +41,30 @@ class NIHChestXrayDataset(Dataset):
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
         fname = row["Image Index"]
-        img_path = self.image_map.get(fname)
-        if img_path is None or not img_path.exists():
-            dummy = torch.zeros(3, IMG_SIZE, IMG_SIZE)
-            target = torch.zeros(len(self.classes))
-            return dummy, target
-        img = Image.open(img_path).convert("RGB")
+        p = self.image_map.get(fname)
+        if p is None or not p.exists():
+            if self.skip_missing:
+                img = Image.new("RGB", (IMG_SIZE_2D, IMG_SIZE_2D))
+            else:
+                raise FileNotFoundError(f"{fname} not found under {self.root}")
+        else:
+            img = Image.open(p).convert("RGB")
         img = self.transform(img)
         labels = row["Finding Labels"].split("|")
-        target = torch.zeros(len(self.classes))
-        for l in labels:
-            if l in self.class_to_idx:
-                target[self.class_to_idx[l]] = 1.0
+        target = torch.zeros(len(self.classes), dtype=torch.float32)
+        for lab in labels:
+            if lab in self.class_to_idx:
+                target[self.class_to_idx[lab]] = 1.0
         return img, target
 
-# ============================================================
-# HAM10000 Skin Dataset
-# ============================================================
 class SkinDataset(Dataset):
     def __init__(self, root, transform=None):
         root = Path(root)
-        self.meta = pd.read_csv(root / "HAM10000_metadata.csv")
         self.root = root
-        self.transform = transform or DEFAULT_TRANSFORM
+        self.meta = pd.read_csv(root / "HAM10000_metadata.csv")
+        self.transform = transform or TRANSFORM
         self.classes = sorted(self.meta["dx"].unique())
-        self.class_to_idx = {c: i for i, c in enumerate(self.classes)}
+        self.class_to_idx = {c:i for i,c in enumerate(self.classes)}
 
     def __len__(self):
         return len(self.meta)
@@ -83,57 +74,42 @@ class SkinDataset(Dataset):
         img_path = self.root / "ham10000_images_part_1" / f"{row['image_id']}.jpg"
         img = Image.open(img_path).convert("RGB")
         img = self.transform(img)
-        y = torch.tensor(self.class_to_idx[row["dx"]], dtype=torch.long)
-        return img, y
+        label = self.class_to_idx[row["dx"]]
+        return img, torch.tensor(label, dtype=torch.long)
 
-# ============================================================
-# Brain MRI Dataset
-# ============================================================
-class MRIDataset(Dataset):
+class MRISliceDataset(Dataset):
+    """
+    Safe MRI dataset that treats each sample as an image (if provided as jpg/png).
+    If your MRI dataset is not slice images, convert/preprocess separately.
+    """
     def __init__(self, root, transform=None):
         root = Path(root)
-        valid_exts = [".jpg", ".jpeg", ".png"]
-
-        # Filter only real image-containing subfolders
-        subdirs = [
-            d for d in root.iterdir()
-            if d.is_dir() and any(f.suffix.lower() in valid_exts for f in d.iterdir())
-        ]
-
         self.samples = []
-        for sub in sorted(subdirs):
-            for f in sub.rglob("*"):
-                if f.suffix.lower() in valid_exts:
-                    self.samples.append((f, sub.name))
+        for p in root.rglob("*"):
+            if p.suffix.lower() in [".png", ".jpg", ".jpeg"]:
+                # label by parent folder name
+                label = p.parent.name
+                self.samples.append((p, label))
+        self.transform = transform or TRANSFORM
+        self.classes = sorted(list({lab for _,lab in self.samples}))
+        self.class_to_idx = {c:i for i,c in enumerate(self.classes)}
 
-        self.transform = transform or DEFAULT_TRANSFORM
-        self.classes = sorted(list({lab for _, lab in self.samples}))
-        self.class_to_idx = {c: i for i, c in enumerate(self.classes)}
-
-    def __len__(self):
-        return len(self.samples)
-
+    def __len__(self): return len(self.samples)
     def __getitem__(self, idx):
-        p, label = self.samples[idx]
+        p, lab = self.samples[idx]
         img = Image.open(p).convert("RGB")
         img = self.transform(img)
-        label_idx = self.class_to_idx[label]
-        assert 0 <= label_idx < len(self.classes), f"Invalid label {label} -> {label_idx}"
-        return img, torch.tensor(label_idx, dtype=torch.long)
+        return img, torch.tensor(self.class_to_idx[lab], dtype=torch.long)
 
-# ============================================================
-# DataLoader Getter
-# ============================================================
-def get_dataloader(modality, batch_size=8, shuffle=True, num_workers=2, transform=None):
+def get_dataloader(modality, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS):
     m = modality.upper()
     if m == "XRAY":
         csv = KAGGLE_PATHS["XRAY"] / "Data_Entry_2017.csv"
-        imgs_root = KAGGLE_PATHS["XRAY"]
-        ds = NIHChestXrayDataset(csv, imgs_root, transform)
+        ds = NIHChestXrayDataset(csv, KAGGLE_PATHS["XRAY"])
     elif m == "SKIN":
-        ds = SkinDataset(KAGGLE_PATHS["SKIN"], transform)
+        ds = SkinDataset(KAGGLE_PATHS["SKIN"])
     elif m == "MRI":
-        ds = MRIDataset(KAGGLE_PATHS["MRI"], transform)
+        ds = MRISliceDataset(KAGGLE_PATHS["MRI"])
     else:
-        raise ValueError(f"Unknown modality: {modality}")
+        raise ValueError("Unknown modality")
     return DataLoader(ds, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers, pin_memory=True)
