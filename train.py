@@ -7,11 +7,18 @@ Implements:
 3. Correct train/val transform handling inside K-Fold.
 4. Saving CV metrics to 'results/'.
 5. Training final models using the 'average best epoch' from CV.
+
+*** OPTIMIZED VERSION ***
+- Added Automatic Mixed Precision (AMP) for faster training.
+- Set zero_grad(set_to_none=True) for minor speedup.
 """
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
+# ADDED for AMP
+from torch.cuda.amp import GradScaler, autocast 
+
 # FIXED (Fix 1): Import Dataset
 from torch.utils.data import Dataset, ConcatDataset, DataLoader, Subset 
 import numpy as np
@@ -70,6 +77,9 @@ def train_model_fold(model, dataloader_train, dataloader_val, criterion, optimiz
     best_epoch = 1
     final_val_accuracy = 0.0
     
+    # Initialize AMP GradScaler
+    scaler = GradScaler(enabled=(DEVICE.type == 'cuda'))
+    
     for epoch in range(num_epochs):
         model.train()
         train_loss = 0.0
@@ -80,15 +90,21 @@ def train_model_fold(model, dataloader_train, dataloader_val, criterion, optimiz
             else: # PyTorch (2D)
                 inputs, labels = batch[0].to(DEVICE), batch[1].to(DEVICE)
 
-            optimizer.zero_grad()
+            # OPTIMIZED: Use set_to_none=True
+            optimizer.zero_grad(set_to_none=True)
             
-            # FIXED (Fix 3): Use robust logit extraction
-            outputs = model(inputs)
-            logits = extract_logits(outputs)
+            # OPTIMIZED: AMP autocast for forward pass
+            with autocast(enabled=(DEVICE.type == 'cuda')):
+                # FIXED (Fix 3): Use robust logit extraction
+                outputs = model(inputs)
+                logits = extract_logits(outputs)
+                loss = criterion(logits, labels.squeeze(-1).long())
+
+            # OPTIMIZED: Scaler backward pass
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
             
-            loss = criterion(logits, labels.squeeze(-1).long())
-            loss.backward()
-            optimizer.step()
             train_loss += loss.item() * inputs.size(0)
             
         avg_train_loss = train_loss / len(dataloader_train.dataset)
@@ -106,11 +122,13 @@ def train_model_fold(model, dataloader_train, dataloader_val, criterion, optimiz
                 else:
                     inputs, labels = batch[0].to(DEVICE), batch[1].to(DEVICE)
 
-                # FIXED (Fix 3): Use robust logit extraction
-                outputs = model(inputs)
-                logits = extract_logits(outputs)
-
-                loss = criterion(logits, labels.squeeze(-1).long())
+                # OPTIMIZED: AMP autocast for validation (no scaler)
+                with autocast(enabled=(DEVICE.type == 'cuda')):
+                    # FIXED (Fix 3): Use robust logit extraction
+                    outputs = model(inputs)
+                    logits = extract_logits(outputs)
+                    loss = criterion(logits, labels.squeeze(-1).long())
+                
                 val_loss += loss.item() * inputs.size(0)
                 
                 _, predicted = torch.max(logits.data, 1)
@@ -136,6 +154,10 @@ def train_final_model(model, dataloader_train, criterion, optimizer, num_epochs)
     No validation.
     """
     model.train()
+    
+    # Initialize AMP GradScaler
+    scaler = GradScaler(enabled=(DEVICE.type == 'cuda'))
+    
     for epoch in range(num_epochs):
         train_loss = 0.0
         for batch in dataloader_train:
@@ -144,15 +166,21 @@ def train_final_model(model, dataloader_train, criterion, optimizer, num_epochs)
             else: # PyTorch (2D)
                 inputs, labels = batch[0].to(DEVICE), batch[1].to(DEVICE)
 
-            optimizer.zero_grad()
+            # OPTIMIZED: Use set_to_none=True
+            optimizer.zero_grad(set_to_none=True)
             
-            # FIXED (Fix 3): Use robust logit extraction
-            outputs = model(inputs)
-            logits = extract_logits(outputs)
+            # OPTIMIZED: AMP autocast for forward pass
+            with autocast(enabled=(DEVICE.type == 'cuda')):
+                # FIXED (Fix 3): Use robust logit extraction
+                outputs = model(inputs)
+                logits = extract_logits(outputs)
+                loss = criterion(logits, labels.squeeze(-1).long())
             
-            loss = criterion(logits, labels.squeeze(-1).long())
-            loss.backward()
-            optimizer.step()
+            # OPTIMIZED: Scaler backward pass
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+
             train_loss += loss.item() * inputs.size(0)
         
         avg_train_loss = train_loss / len(dataloader_train.dataset)
