@@ -10,12 +10,14 @@ from pathlib import Path
 # ============================================================
 
 DEVICE = "cuda"
-IMG_SIZE_2D = 224              # Standard input resolution for ViT/ConvNeXt
-BATCH_SIZE = 8                 # Batch size per GPU
-NUM_WORKERS = 2                # DataLoader workers (Kaggle-safe)
-EPOCHS = 6                     # Default number of epochs
-LR = 2e-4                      # Default learning rate
-USE_AMP = True                 # Enable mixed-precision training
+IMG_SIZE_2D = 224              # for 2D models (ViT, ConvNeXt, EfficientNet)
+IMG_SIZE_3D = (128, 128, 128)  # for potential 3D models (MRI, MONAI)
+BATCH_SIZE = 8
+NUM_WORKERS = 2
+EPOCHS = 6
+LR = 2e-4
+USE_AMP = True
+
 
 # ============================================================
 # 🧩 Dataset Configuration
