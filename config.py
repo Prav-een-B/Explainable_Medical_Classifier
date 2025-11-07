@@ -14,9 +14,9 @@ KAGGLE_PATHS = {
 
 # training
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-BATCH_SIZE = 8        # per step total batch (will be split across GPUs automatically)
+BATCH_SIZE = 16        # per step total batch (will be split across GPUs automatically)
 NUM_WORKERS = 2
-EPOCHS = 6
+EPOCHS = 1
 LR = 2e-4
 USE_AMP = True
 
