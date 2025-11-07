@@ -1,99 +1,87 @@
-"""
-config.py
-Global configuration file for Explainable_Medical_Classifier
-"""
-
 from pathlib import Path
+import torch
+import os
 
 # ============================================================
-# 🧠 General Training Configuration
+# 🧭 PATHS & ROOT SETTINGS
 # ============================================================
 
-DEVICE = "cuda"
-IMG_SIZE_2D = 224              # for 2D models (ViT, ConvNeXt, EfficientNet)
-IMG_SIZE_3D = (128, 128, 128)  # for potential 3D models (MRI, MONAI)
-BATCH_SIZE = 8
-NUM_WORKERS = 2
-EPOCHS = 6
-LR = 2e-4
-USE_AMP = True
+# Root directory for Kaggle (writable)
+ROOT = Path("/kaggle/working")
 
-
-# ============================================================
-# 🧩 Dataset Configuration
-# ============================================================
-
-DATA_ROOT = Path("data")
-CLASS_MAP_JSON = "class_map.json"
-
-# Paths used by dataset_loader.py (Kaggle version)
+# Default dataset roots — update only if you rename your Kaggle datasets
 KAGGLE_PATHS = {
     "XRAY": Path("/kaggle/input/data"),  # NIH Chest X-ray
     "SKIN": Path("/kaggle/input/skin-cancer-mnist-ham10000"),
     "MRI":  Path("/kaggle/input/brain-mri-images-for-brain-tumor-detection"),
 }
 
+# Global data root
+DATA_ROOT = ROOT / "data"
+CLASS_MAP_JSON = DATA_ROOT / "class_map.json"
+
 # ============================================================
-# 🎯 Modality-Specific Configuration
+# 🧮 DATA CONFIGURATION
 # ============================================================
 
+# 2D modalities (e.g., XRAY, SKIN)
+IMG_SIZE_2D = 224
+
+# 3D modalities (e.g., MRI)
+IMG_SIZE_3D = (96, 96, 96)  # (Depth, Height, Width)
+
+# Modality-specific config
 MODALITY_CONFIG = {
-    "XRAY": {
-        "n_classes": 14,
-        "loss": "BCEWithLogitsLoss",
-        "task_type": "multi-label"
-    },
-    "SKIN": {
-        "n_classes": 7,
-        "loss": "CrossEntropyLoss",
-        "task_type": "multi-class"
-    },
-    "MRI": {
-        "n_classes": 3,
-        "loss": "CrossEntropyLoss",
-        "task_type": "multi-class"
-    }
+    "XRAY": {"dim": 2, "channels": 3, "size": IMG_SIZE_2D, "model_type": "2D"},
+    "SKIN": {"dim": 2, "channels": 3, "size": IMG_SIZE_2D, "model_type": "2D"},
+    "MRI":  {"dim": 3, "channels": 1, "size": IMG_SIZE_3D, "model_type": "3D"},
 }
 
 # ============================================================
-# 🧠 Vision Transformer (ViT) Backbone
+# ⚙️ TRAINING CONFIGURATION
 # ============================================================
 
-# For HuggingFace Transformers
+LEARNING_RATE = 2e-4
+EPOCHS = 6
+
+# Batches and workers (tuned for Kaggle)
+BATCH_SIZE = 8
+NUM_WORKERS = 2
+
+# Optional K-Fold cross-validation (keep small for speed)
+K_FOLDS = 3
+
+# ============================================================
+# 🧠 MODEL CONFIGURATION
+# ============================================================
+
+# Pretrained Vision Transformer (2D)
 VIT_2D_PRETRAINED = "google/vit-base-patch16-224-in21k"
 
-# Optional local checkpoint for fine-tuning
-MODEL_2D_CHECKPOINT = None  # e.g., Path("checkpoints/vit_pretrained.pt") if you have one
+# Optional 3D model backbone (for MRI or MONAI)
+VIT_3D_PRETRAINED = "monai/vitautoenc"  # not always used
 
-# If using timm instead of transformers:
-# VIT_2D_PRETRAINED = "vit_base_patch16_224"
+# Local checkpoint paths (will auto-create)
+SAVE_PATH = ROOT / "models" / "weights"
+SAVE_PATH.mkdir(parents=True, exist_ok=True)
 
-
-# ============================================================
-# 🧩 Other Model Backbones
-# ============================================================
-
-# For ConvNeXt-based multi-task model
-CONVNEXT_VARIANT = "convnext_tiny"  # Options: tiny, base, small, large
-CONVNEXT_PRETRAINED = True
-
-# For EfficientNet (if needed)
-EFFICIENT_VARIANT = "tf_efficientnet_b0"
-EFFICIENT_PRETRAINED = True
+# Pretrained / resume checkpoints
+MODEL_2D_CHECKPOINT = SAVE_PATH / "vit2d_checkpoint.pth"
+MODEL_3D_CHECKPOINT = SAVE_PATH / "best_model_3d.pth"
 
 # ============================================================
-# 💾 Checkpointing & Logging
+# 📊 EXPLAINABILITY & LOGGING
 # ============================================================
 
-CHECKPOINT_DIR = Path("/kaggle/working/checkpoints")
-CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+LIME_SAMPLES = 1000
+SHAP_NSAMPLES = 100
 
-LOG_FILE = Path("/kaggle/working/train_log.csv")
+RESULTS_DIR = ROOT / "results"
+RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
 # ============================================================
-# 📈 Miscellaneous
+# 💻 DEVICE SETUP
 # ============================================================
 
-SEED = 42                       # Reproducibility
-PRINT_FREQ = 50                 # Logging frequency per epoch
-SAVE_EVERY = 1                  # Save checkpoint after every N epochs
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"✅ Config loaded | Device: {DEVICE}")
