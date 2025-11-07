@@ -2,216 +2,220 @@
 """
 Inference and Explanation script.
 
-This script loads the models trained by 'train.py' to perform classification
-and generate explanations:
-- LIME (for 2D)
-- SHAP (for 2D)
-- Grad-CAM (for 3D)
+This script loads the model trained by 'train_vit_multi_task.py' 
+to perform classification and generate 2D explanations:
+- LIME
+- SHAP
 """
 
 import numpy as np
 from PIL import Image
 import torch
-import json
+from torchvision import transforms
 import os
-from torchvision import transforms # Added for denormalizing
+from pathlib import Path
 
-# Import data loader *only* for helper functions and class map
-# FIXED (Fix 6): Removed unused get_2d_transforms
-from data.dataset_loader import get_dataloader, load_class_map
-from models.vit_model import MultimodalViTWrapper
+# Import the correct model and data loader
+from data.dataset_loader import get_dataloader
+from models.multitask_vit import MultiTaskViT 
 from explainability.lime_explainer import LIME2DExplainer
-from explainability.gradcam_explainer import GradCAM3DExplainer
-from explainability.shap_explainer import SHAP2DExplainer # ADDED
+from explainability.shap_explainer import SHAP2DExplainer
 from utils.visualization import (
-    show_image_with_mask, show_3d_explanation, 
-    show_metrics, show_shap_explanation
+    show_image_with_mask, show_shap_explanation, show_metrics
 )
 from utils.metrics import evaluate_model
-from config import MODALITY_CONFIG, DEVICE, IMG_SIZE_2D, RESULTS_DIR, SHAP_NSAMPLES
+from config import (
+    DEVICE, CHECKPOINT_DIR, RESULTS_DIR, 
+    SHAP_NSAMPLES, VAL_TRANSFORM
+)
 
-def get_denormalized_images(batch_tensors):
+def load_trained_model(num_xray, num_skin, num_mri):
     """
-    Denormalizes a batch of 2D tensors for visualization.
+    Loads the latest checkpoint from the CHECKPOINT_DIR.
     """
-    vis_input_list = []
-    pil_input_list = []
+    model = MultiTaskViT(num_xray, num_skin, num_mri)
     
-    # ViT normalization is mean=0.5, std=0.5
-    # Denorm: (tensor * 0.5) + 0.5
+    # Load checkpoint
+    ckpts = sorted(Path(CHECKPOINT_DIR).glob("vit_epoch*.pt"))
+    if not ckpts:
+        raise FileNotFoundError(f"No checkpoints found in {CHECKPOINT_DIR}. Did you run train_vit_multi_task.py?")
+        
+    latest_ckpt_path = ckpts[-1]
+    print(f"Loading checkpoint: {latest_ckpt_path}")
     
-    for img_tensor in batch_tensors:
-        # Denormalize from [-1, 1] to [0, 1]
-        denorm_tensor = (img_tensor * 0.5) + 0.5
-        denorm_tensor = denorm_tensor.clamp(0, 1)
+    # Load state dict
+    ckpt = torch.load(latest_ckpt_path, map_location=DEVICE)
+    
+    # Adjust for DataParallel prefix 'module.' if it was saved with it
+    model_state = ckpt["model_state"]
+    if next(iter(model_state.keys())).startswith("module."):
+        model_state = {k.replace("module.", ""): v for k, v in model_state.items()}
         
-        # Create PIL image for model (expects 0-255)
-        pil_img = transforms.ToPILImage()(denorm_tensor)
-        pil_input_list.append(pil_img)
+    model.load_state_dict(model_state)
+    model = model.to(DEVICE)
+    model.eval()
+    return model
+
+def get_denormalizer():
+    """Returns a function to denormalize images for visualization."""
+    mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+    std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+    
+    def denormalize(tensor):
+        tensor = tensor * std + mean
+        tensor = tensor.clamp(0, 1)
+        return transforms.ToPILImage()(tensor)
         
-        # Create numpy array for explainers (expects 0-255)
-        vis_input_list.append(np.array(pil_img))
+    return denormalize
+
+def predict_fn_wrapper(model, task):
+    """
+    Wraps the model's forward pass for the explainers.
+    Handles numpy -> tensor conversion.
+    """
+    def predict_proba(numpy_images):
+        # Convert (N, H, W, C) numpy array to (N, C, H, W) tensor
+        pil_images = [Image.fromarray(img.astype('uint8')) for img in numpy_images]
+        tensors = torch.stack([VAL_TRANSFORM(img) for img in pil_images]).to(DEVICE)
+        
+        with torch.no_grad():
+            logits = model(tensors, task)
             
-    return pil_input_list, vis_input_list
+            # Use Softmax for single-label (SKIN, MRI)
+            if task in ["SKIN", "MRI"]:
+                probs = torch.softmax(logits, dim=1)
+            # Use Sigmoid for multi-label (XRAY)
+            else:
+                probs = torch.sigmoid(logits)
+                
+        return probs.cpu().numpy()
+        
+    return predict_proba
 
-def demo_modality(modality_type, multimodal_model, class_map, class_names_list, sample_count=4):
+
+def demo_modality_2d(model, task_name, class_names, sample_count=4):
+    """
+    Runs prediction and explanation for a 2D modality (SKIN or MRI).
+    """
     print(f"\n========================================================")
-    print(f"DEMO: {modality_type} (Dataset: {modality_type})")
+    print(f"DEMO: {task_name}")
     print(f"========================================================")
 
-    # 1. Load Data (using 'test' split)
+    # 1. Load Data (using shuffle=False to get consistent results)
     try:
-        dl = get_dataloader(modality_type, class_map, split="test", batch_size=sample_count, shuffle=False)
+        # Use validation transform, no shuffling
+        dl = get_dataloader(task_name, batch_size=sample_count, shuffle=False)
         batch = next(iter(dl))
+        input_tensors, labels = batch[0], batch[1]
     except Exception as e:
-        print(f"Could not load data for {modality_type}: {e}")
+        print(f"Could not load data for {task_name}: {e}")
         return
 
-    # 2. Prepare Inputs based on modality
-    if modality_type in ["XRAY", "HISTOPATHOLOGY"]:
-        input_tensors, labels = batch[0], batch[1]
-        
-        model_input, vis_input_list = get_denormalized_images(input_tensors)
-        
-        # We'll explain the first image
-        explainer_input_np = vis_input_list[0] 
-        # We'll use the rest of the batch as the SHAP background
-        shap_background_np = np.stack(vis_input_list[1:])
-        
-    elif modality_type == "MRI":
-        input_tensors, labels = batch["image"], batch["label"]
-        model_input = input_tensors 
-        explainer_input_tensor = model_input[0].unsqueeze(0).to(DEVICE)
-        
-    else:
-        raise ValueError("Modality not supported in demo.")
-        
+    # 2. Prepare Inputs
+    input_tensors = input_tensors.to(DEVICE)
+    labels = labels.to(DEVICE)
+    denormalize = get_denormalizer()
+    
+    # Get numpy images for visualization
+    vis_input_list = [np.array(denormalize(t)) for t in input_tensors.cpu()]
+    
+    # We'll explain the first image
+    explainer_input_np = vis_input_list[0]
+    # We'll use the rest of the batch as the SHAP background
+    shap_background_np = np.stack(vis_input_list[1:])
+
     # 3. Prediction and Evaluation
-    probs = multimodal_model.predict(model_input, modality_type)
-    preds = probs.argmax(axis=1)
+    with torch.no_grad():
+        logits = model(input_tensors, task_name)
     
-    true_labels_np = labels.cpu().numpy().flatten()[:sample_count]
-    report = evaluate_model(true_labels_np, preds, labels=list(range(len(class_names_list))))
-    show_metrics(report, title=f"Classification Report for {modality_type}")
+    preds = logits.argmax(axis=1).cpu().numpy()
+    true_labels_np = labels.cpu().numpy().flatten()
     
-    # Save the full report to results/
-    report_filename = RESULTS_DIR / f"report_{modality_type}.txt"
-    with open(report_filename, 'w') as f:
-        f.write(f"Classification Report for {modality_type}\n\n")
-        f.write(report)
-    print(f"Classification report saved to {report_filename}")
-    
-    # 4. Explainability (Routing)
+    report = evaluate_model(true_labels_np, preds, labels=list(range(len(class_names))))
+    show_metrics(report, title=f"Batch Classification Report for {task_name}")
+
+    # 4. Explainability
     pred_index = preds[0]
-    pred_name = class_names_list[pred_index]
+    pred_name = class_names[pred_index]
     
     print(f"\n--- Explanation for first sample (Pred: {pred_index} - '{pred_name}') ---")
 
-    if modality_type in ["XRAY", "HISTOPATHOLOGY"]:
-        
-        # --- LIME Explanation ---
-        print("Running LIME...")
-        def predict_wrapper_2d(images_np_list):
-            pil_list = [Image.fromarray(x.astype('uint8')) for x in images_np_list]
-            return multimodal_model.predict(pil_list, modality_type)
-            
-        lime = LIME2DExplainer(predict_wrapper_2d)
-        explanation, temp, mask = lime.explain(explainer_input_np, label=pred_index, num_features=10)
-        
-        lime_save_path = RESULTS_DIR / f"lime_explanation_{modality_type}.png"
-        show_image_with_mask(explainer_input_np, mask, 
-                             title=f"LIME 2D Mask for {modality_type} (Pred: '{pred_name}')",
-                             save_path=lime_save_path)
-        print(f"LIME explanation saved to {lime_save_path}")
+    # Create the prediction function for explainers
+    predict_proba = predict_fn_wrapper(model, task_name)
 
-        # --- SHAP Explanation (Point 4) ---
-        print("Running SHAP... (This may take a moment)")
-        shap_explainer = SHAP2DExplainer(predict_wrapper_2d, shap_background_np)
-        shap_values = shap_explainer.explain(
-            explainer_input_np.reshape(1, *explainer_input_np.shape), 
-            nsamples=SHAP_NSAMPLES
-        )
-        
-        shap_save_path = RESULTS_DIR / f"shap_explanation_{modality_type}.png"
-        show_shap_explanation(
-            shap_values, 
-            explainer_input_np,
-            class_names=class_names_list,
-            title=f"SHAP Explanation for {modality_type} (Pred: '{pred_name}')",
-            save_path=shap_save_path
-        )
-        print(f"SHAP explanation saved to {shap_save_path}")
+    # --- LIME Explanation ---
+    print("Running LIME...")
+    lime = LIME2DExplainer(predict_proba)
+    explanation, temp, mask = lime.explain(explainer_input_np, label=pred_index, num_features=10)
+    
+    lime_save_path = RESULTS_DIR / f"lime_explanation_{task_name}.png"
+    show_image_with_mask(explainer_input_np, mask, 
+                         title=f"LIME 2D Mask for {task_name} (Pred: '{pred_name}')",
+                         save_path=lime_save_path)
+    print(f"LIME explanation saved to {lime_save_path}")
 
-        
-    elif modality_type == "MRI":
-        # --- 3D Grad-CAM Explanation ---
-        print("Running 3D Grad-CAM...")
-        raw_3d_model = multimodal_model.get_model(modality_type)
-        target_layer = "model.transformer.blocks[-1].norm1" 
-        
-        gradcam = GradCAM3DExplainer(raw_3d_model, target_layer)
-        heatmap = gradcam.explain(explainer_input_tensor, label=pred_index)
-        
-        gradcam_save_path = RESULTS_DIR / f"gradcam_explanation_{modality_type}.png"
-        show_3d_explanation(
-            explainer_input_tensor.squeeze(0), 
-            heatmap[0],
-            title=f"3D Grad-CAM for {modality_type} (Pred: '{pred_name}')",
-            save_path=gradcam_save_path
-        )
-        print(f"Grad-CAM explanation saved to {gradcam_save_path}")
+    # --- SHAP Explanation ---
+    print("Running SHAP... (This may take a moment)")
+    shap_explainer = SHAP2DExplainer(predict_proba, shap_background_np)
+    shap_values = shap_explainer.explain(
+        explainer_input_np.reshape(1, *explainer_input_np.shape), 
+        nsamples=SHAP_NSAMPLES
+    )
+    
+    shap_save_path = RESULTS_DIR / f"shap_explanation_{task_name}.png"
+    show_shap_explanation(
+        shap_values, 
+        explainer_input_np,
+        class_names=class_names,
+        title=f"SHAP Explanation for {task_name} (Pred: '{pred_name}')",
+        save_path=shap_save_path
+    )
+    print(f"SHAP explanation saved to {shap_save_path}")
 
 
 def main_demo():
     print("--- Running Inference & Explanation ---")
-    os.makedirs(RESULTS_DIR, exist_ok=True)
     
-    # 1. Load the dynamic class map created by train.py
+    # 1. Get class maps from data loader
+    # We load a temporary dataloader just to get class info
     try:
-        class_map = load_class_map()
+        print("Loading class information...")
+        xray_dl = get_dataloader("XRAY", BATCH_SIZE)
+        skin_dl = get_dataloader("SKIN", BATCH_SIZE)
+        mri_dl  = get_dataloader("MRI", BATCH_SIZE)
+
+        class_names_xray = xray_dl.dataset.classes
+        class_names_skin = skin_dl.dataset.classes
+        class_names_mri = mri_dl.dataset.classes
+    except Exception as e:
+        print(f"Error loading datasets: {e}")
+        print("Please ensure your datasets are correctly configured in config.py")
+        return
+
+    # 2. Load the trained model
+    try:
+        model = load_trained_model(
+            num_xray=len(class_names_xray),
+            num_skin=len(class_names_skin),
+            num_mri=len(class_names_mri)
+        )
     except FileNotFoundError as e:
         print(f"Error: {e}")
         return
-        
-    num_labels = len(class_map)
-    
-    # FIXED (Fix 10): Create a sorted list of class names from the map
-    # This ensures class_names_list[0] == "DiseaseA", class_names_list[1] == "DiseaseB", etc.
-    class_names_list = sorted(class_map.keys(), key=lambda k: class_map[k])
 
-    # 2. Initialize Wrapper in INFERENCE mode
-    try:
-        multimodal_vit = MultimodalViTWrapper(num_labels=num_labels, load_from_scratch=False)
-    except FileNotFoundError as e:
-        print(f"Error: {e}")
-        print("Could not load trained models. Did you run train.py successfully?")
-        return
-
-    # Run 2D Demo (XRAY)
-    demo_modality(
-        modality_type="XRAY", 
-        multimodal_model=multimodal_vit,
-        class_map=class_map,
-        class_names_list=class_names_list,
+    # 3. Run Demos (2D tasks are best for LIME/SHAP)
+    demo_modality_2d(
+        model=model,
+        task_name="SKIN", 
+        class_names=class_names_skin,
         sample_count=4 # 1 to explain, 3 for background
     )
     
-    # Run 2D Demo (HISTOPATHOLOGY)
-    demo_modality(
-        modality_type="HISTOPATHOLOGY", 
-        multimodal_model=multimodal_vit,
-        class_map=class_map,
-        class_names_list=class_names_list,
+    demo_modality_2d(
+        model=model,
+        task_name="MRI", 
+        class_names=class_names_mri,
         sample_count=4 # 1 to explain, 3 for background
-    )
-    
-    # Run 3D Demo (MRI)
-    demo_modality(
-        modality_type="MRI", 
-        multimodal_model=multimodal_vit,
-        class_map=class_map,
-        class_names_list=class_names_list,
-        sample_count=2
     )
 
 if __name__ == "__main__":
