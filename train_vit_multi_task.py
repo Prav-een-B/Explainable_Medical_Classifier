@@ -33,11 +33,22 @@ def train_one(task, dl, model, opt, crit, scaler):
 
 def create_model_and_optim(n_xray, n_skin, n_mri):
     model = MultiTaskViT(n_xray, n_skin, n_mri)
-    # multi-GPU support
+
+    # --- Load checkpoint before wrapping ---
+    ckpts = sorted(Path(CHECKPOINT_DIR).glob("vit_epoch*.pt"))
+    if ckpts:
+        latest = ckpts[-1]
+        print("Resuming from", latest)
+        ckpt = torch.load(latest, map_location=DEVICE)
+        model.load_state_dict(ckpt["model_state"], strict=False)
+        print("✅ Loaded checkpoint successfully")
+
+    # Now wrap if multiple GPUs
     if torch.cuda.device_count() > 1:
         print(f"Using DataParallel on {torch.cuda.device_count()} GPUs")
         model = nn.DataParallel(model)
     model = model.to(DEVICE)
+
     opt = optim.AdamW(model.parameters(), lr=LR)
     return model, opt
 
