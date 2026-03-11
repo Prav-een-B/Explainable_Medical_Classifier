@@ -10,6 +10,25 @@ from config import DEVICE, EPOCHS, LR, BATCH_SIZE, CHECKPOINT_DIR, USE_AMP
 from data.dataset_loader import get_dataloader
 from models.multitask_vit import MultiTaskViT
 
+
+# ============================
+# ✅ Utility: Safe key-fix function
+# ============================
+def fix_state_dict_keys(state_dict, model_state):
+    has_module_ckpt = any(k.startswith("module.") for k in state_dict.keys())
+    has_module_model = any(k.startswith("module.") for k in model_state.keys())
+    if has_module_model and not has_module_ckpt:
+        print("🧩 Adding 'module.' prefix (single-GPU → multi-GPU)")
+        state_dict = {f"module.{k}": v for k, v in state_dict.items()}
+    elif not has_module_model and has_module_ckpt:
+        print("🧩 Removing 'module.' prefix (multi-GPU → single-GPU)")
+        state_dict = {k.replace("module.", "", 1): v for k, v in state_dict.items()}
+    return state_dict
+
+
+# ============================
+# ✅ Training Function
+# ============================
 def train_one(task, dl, model, opt, crit, scaler):
     model.train()
     total = 0.0
@@ -21,7 +40,6 @@ def train_one(task, dl, model, opt, crit, scaler):
         opt.zero_grad()
         with amp.autocast(device_type="cuda", enabled=USE_AMP):
             preds = model(imgs, task)
-            # choose loss type: XRAY -> BCEWithLogits (multi-label), others -> CrossEntropy
             loss = crit(preds, labels)
         scaler.scale(loss).backward()
         scaler.step(opt)
@@ -31,17 +49,36 @@ def train_one(task, dl, model, opt, crit, scaler):
         pbar.set_postfix_str(f"loss={total/count:.4f}")
     return total / max(1, count)
 
+
+# ============================
+# ✅ Model + Optimizer Creation
+# ============================
 def create_model_and_optim(n_xray, n_skin, n_mri):
     model = MultiTaskViT(n_xray, n_skin, n_mri)
-    # multi-GPU support
+
+    # Wrap model first (so DataParallel keys are consistent)
     if torch.cuda.device_count() > 1:
         print(f"Using DataParallel on {torch.cuda.device_count()} GPUs")
         model = nn.DataParallel(model)
     model = model.to(DEVICE)
+
+    # Load checkpoint if exists
+    ckpts = sorted(Path(CHECKPOINT_DIR).glob("vit_epoch*.pt"))
+    if ckpts:
+        latest = ckpts[-1]
+        print("Resuming from", latest)
+        ckpt = torch.load(latest, map_location=DEVICE)
+        state_dict = fix_state_dict_keys(ckpt["model_state"], model.state_dict())
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        print(f"✅ Loaded checkpoint. Missing={len(missing)}, Unexpected={len(unexpected)}")
+
     opt = optim.AdamW(model.parameters(), lr=LR)
     return model, opt
 
-# --- MODIFIED: Added 'suffix' argument to save intermediate checkpoints ---
+
+# ============================
+# ✅ Checkpoint Saver
+# ============================
 def save_checkpoint(epoch, model, opt, scaler, suffix, out_dir=CHECKPOINT_DIR):
     ckpt = {
         "epoch": epoch,
@@ -50,11 +87,14 @@ def save_checkpoint(epoch, model, opt, scaler, suffix, out_dir=CHECKPOINT_DIR):
         "scaler_state": scaler.state_dict()
     }
     Path(out_dir).mkdir(parents=True, exist_ok=True)
-    # --- MODIFIED: Filename now includes the suffix ---
-    path = Path(out_dir) / f"vit_epoch{epoch:02d}_{suffix}.pt"
+    path = Path(out_dir) / f"vit_epoch{epoch:02d}_skin_mri_only.pt"
     torch.save(ckpt, path)
-    print(f"Saved checkpoint: {path}")
+    print(f"💾 Saved checkpoint: {path}")
 
+
+# ============================
+# ✅ Main Training Loop
+# ============================
 def main():
     print("Device:", DEVICE)
     xray_dl = get_dataloader("XRAY", BATCH_SIZE)
@@ -67,48 +107,54 @@ def main():
 
     model, opt = create_model_and_optim(nx, ns, nm)
 
-    # losses
     crit_x = nn.BCEWithLogitsLoss()
     crit_ce = nn.CrossEntropyLoss()
-
     scaler = amp.GradScaler() if USE_AMP else None
 
-    start_epoch = 1
-    # resume pick the latest checkpoint automatically (if exists)
+    # --- Resume optimizer/scaler only ---
     ckpts = sorted(Path(CHECKPOINT_DIR).glob("vit_epoch*.pt"))
+    start_epoch = 9
     if ckpts:
         latest = ckpts[-1]
-        print("Resuming from", latest)
+        print("🔁 Resuming optimizer/scaler from", latest)
         ckpt = torch.load(latest, map_location=DEVICE)
-        model.load_state_dict(ckpt["model_state"])
-        opt.load_state_dict(ckpt["opt_state"])
+
+        # ✅ FIX KEY PREFIX HERE ALSO BEFORE LOADING MODEL STATE (for safety)
+        state_dict = fix_state_dict_keys(ckpt["model_state"], model.state_dict())
+        model.load_state_dict(state_dict, strict=False)
+
+        try:
+            opt.load_state_dict(ckpt["opt_state"])
+        except Exception as e:
+            print("⚠️ Optimizer load skipped:", e)
         if scaler and "scaler_state" in ckpt:
-            scaler.load_state_dict(ckpt["scaler_state"])
-        
-        # --- MODIFIED: Robust resume logic ---
-        # Get the epoch from the checkpoint. We will re-run this epoch
-        # to ensure all tasks are completed, even if interrupted.
-        start_epoch = ckpt.get("epoch", 1)
-        print(f"Restarting at epoch {start_epoch} to ensure all tasks are complete.")
+            try:
+                scaler.load_state_dict(ckpt["scaler_state"])
+            except Exception as e:
+                print("⚠️ Scaler load skipped:", e)
 
-    for e in range(start_epoch, EPOCHS + 1):
+        start_epoch = ckpt.get("epoch", 4) + 1
+        print(f"✅ Resumed up to epoch {start_epoch-1}. Continuing from {start_epoch}.")
+    else:
+        print("⚠️ No checkpoint found. Starting from scratch.")
+
+    end_epoch = start_epoch + 3
+    print(f"Training epochs {start_epoch} → {end_epoch}")
+
+    for e in range(start_epoch, end_epoch + 1):
         t0 = time.time()
-
-        # --- MODIFIED: Save checkpoint after each task ---
-        
-        # 1. TRAIN SKIN
         ls = train_one("SKIN", skin_dl, model, opt, crit_ce, scaler if scaler else amp.GradScaler(enabled=False))
         save_checkpoint(e, model, opt, scaler, "skin_done")
 
-        # 2. TRAIN MRI
         lm = train_one("MRI", mri_dl, model, opt, crit_ce, scaler if scaler else amp.GradScaler(enabled=False))
         save_checkpoint(e, model, opt, scaler, "mri_done")
 
-        # 3. TRAIN XRAY (Last, as requested)
-        lx = train_one("XRAY", xray_dl, model, opt, crit_x, scaler if scaler else amp.GradScaler(enabled=False))
-        save_checkpoint(e, model, opt, scaler, "xray_final") # This is the final save for the epoch
-        
-        print(f"Epoch {e}: XRAY={lx:.4f}, SKIN={ls:.4f}, MRI={lm:.4f}  time={(time.time()-t0)/60:.2f}min")
+        # lx = train_one("XRAY", xray_dl, model, opt, crit_x, scaler if scaler else amp.GradScaler(enabled=False))
+        # save_checkpoint(e, model, opt, scaler, "xray_final")
+        lx = 0.0
 
-if __name__=="__main__":
+        print(f"✅ Epoch {e} complete | XRAY={lx:.4f}, SKIN={ls:.4f}, MRI={lm:.4f} | Time={(time.time()-t0)/60:.2f} min")
+
+
+if __name__ == "__main__":
     main()
